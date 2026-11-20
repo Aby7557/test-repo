@@ -1,0 +1,7 @@
+Origin: test-repo
+Label: test-repo
+Suite: stable
+Codename: sileo
+Architectures: iphoneos-arm64 iphoneos-arm64e
+Components: main
+Description: test-repo
