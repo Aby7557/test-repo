@@ -1,0 +1,188 @@
+# RepoMgr-Transfer-API: 1
+# RepoMgr-Transfer-Template: 7
+name: Cloud transfer deb
+run-name: "RepoMgr ${{ inputs.task_id }}"
+
+"on":
+  workflow_dispatch:
+    inputs:
+      task_id:
+        description: "Unique transfer identifier"
+        required: true
+      files:
+        description: "JSON array of {url, filename}"
+        required: true
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - name: Download and commit
+        id: transfer
+        shell: bash
+        env:
+          TASK_ID: ${{ inputs.task_id }}
+          FILES: ${{ inputs.files }}
+        run: |
+          set -euo pipefail
+          python3 <<'PYTRANSFER'
+          import json, os, re, subprocess, tempfile, hashlib, socket, ipaddress
+          from urllib.parse import urlsplit, urljoin
+          from pathlib import Path
+
+          def public_url(url):
+              if not isinstance(url,str) or len(url)>4096 or any(c.isspace() or ord(c)<32 for c in url) or "\\" in url:
+                  raise ValueError('unsafe_url')
+              p=urlsplit(url)
+              if p.scheme!='https' or not p.hostname or p.username is not None or p.password is not None or '?' in url or '#' in url or p.port not in (None,443):
+                  raise ValueError('unsafe_url')
+              host=p.hostname.encode('idna').decode('ascii')
+              if host.endswith('.') or not re.fullmatch(r'[A-Za-z0-9.-]+',host): raise ValueError('unsafe_url')
+              try: addresses={entry[4][0] for entry in socket.getaddrinfo(host,443,type=socket.SOCK_STREAM)}
+              except OSError: raise ValueError('dns_failed') from None
+              if not addresses or any(not ipaddress.ip_address(ip).is_global or ipaddress.ip_address(ip).is_multicast for ip in addresses):
+                  raise ValueError('unsafe_url')
+              return host,sorted(addresses)[0]
+
+          def download(url,tmp):
+              # Resolve and pin each hop; never let curl follow an unchecked redirect or use a proxy.
+              for _ in range(6):
+                  host,ip=public_url(url)
+                  pin='['+ip+']' if ':' in ip else ip
+                  done=subprocess.run(['curl','--disable','-fsS','--proto','=https','--noproxy','*','--resolve',host+':443:'+pin,'--connect-timeout','15','--max-time','90','--max-filesize','41943040','--output',tmp,'--write-out','%{http_code}\n%{redirect_url}','--',url],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  if done.returncode: raise ValueError('download_failed')
+                  status,_,redirect=done.stdout.partition('\n')
+                  if status in ('301','302','303','307','308') and redirect:
+                      url=urljoin(url,redirect.strip()); continue
+                  if status!='200': raise ValueError('download_failed')
+                  return
+              raise ValueError('redirect_limit')
+
+          def transfer(items):
+              if not isinstance(items,list) or not 0<len(items)<=20: raise ValueError('invalid_batch')
+              results=[]; seen=set()
+              Path('debs').mkdir(exist_ok=True)
+              for index,item in enumerate(items):
+                  result={'filename':'invalid-item-'+str(index+1),'status':'failure'}; tmp=None
+                  try:
+                      if not isinstance(item,dict): raise ValueError('invalid_input')
+                      url,name=item.get('url'),item.get('filename')
+                      if not isinstance(name,str) or not re.fullmatch(r'[A-Za-z0-9._+~-]+\.deb',name) or '..' in name or name in seen: raise ValueError('invalid_filename')
+                      result['filename']=name; seen.add(name)
+                      expected=item.get('sha256','')
+                      if not isinstance(expected,str) or not re.fullmatch(r'[A-Fa-f0-9]{64}',expected): raise ValueError('invalid_sha256')
+                      fd,tmp=tempfile.mkstemp(suffix='.deb'); os.close(fd)
+                      download(url,tmp)
+                      data=Path(tmp).read_bytes(); digest=hashlib.sha256(data).hexdigest()
+                      if len(data)>41943040 or not data.startswith(b'!<arch>\n'): raise ValueError('invalid_archive')
+                      if expected.lower()!=digest: raise ValueError('checksum_mismatch')
+                      fields=[subprocess.check_output(['dpkg-deb','-f',tmp,k],text=True,stderr=subprocess.PIPE).strip() for k in ['Package','Version','Architecture']]
+                      if not all(fields) or not re.fullmatch(r'[a-z0-9][a-z0-9+.-]*',fields[0]): raise ValueError('invalid_control')
+                      dest=Path('debs')/re.sub(r'[^A-Za-z0-9._+-]','_', '_'.join(fields)+'.deb')
+                      if len(dest.name)>240: raise ValueError('invalid_control')
+                      if dest.exists():
+                          if hashlib.sha256(dest.read_bytes()).hexdigest()!=digest: raise ValueError('filename_conflict')
+                          result['status']='skipped'
+                      else: dest.write_bytes(data); result['status']='success'
+                  except Exception as error:
+                      allowed={'unsafe_url','dns_failed','download_failed','redirect_limit','invalid_input','invalid_filename','invalid_sha256','invalid_archive','checksum_mismatch','invalid_control','filename_conflict'}
+                      result['error']=str(error) if isinstance(error,ValueError) and str(error) in allowed else 'transfer_failed'
+                  finally:
+                      if tmp: Path(tmp).unlink(missing_ok=True)
+                  results.append(result)
+              return results
+
+          task=os.environ['TASK_ID']
+          if not re.fullmatch('[A-Za-z0-9-]{1,64}',task): raise ValueError('invalid task identifier')
+          results=transfer(json.loads(os.environ['FILES']))
+          Path('.repomgr-results').mkdir(exist_ok=True)
+          Path('.repomgr-results',task+'.json').write_text(json.dumps(results,ensure_ascii=False),encoding='utf-8')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
+              for state in ['success','skipped','failure']: f.write(f"{state}: {sum(r['status']==state for r in results)}\n")
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('has_changes='+str(any(row['status']=='success' for row in results)).lower()+'\n')
+          PYTRANSFER
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add debs .repomgr-results
+          git diff --cached --quiet || git commit -m "Cloud transfer $TASK_ID"
+          git push origin "HEAD:$GITHUB_REF_NAME"
+      - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        if: steps.transfer.outputs.has_changes == 'true'
+      - name: Build package index
+        if: steps.transfer.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y dpkg-dev bzip2
+          # Keep the repository's own identity, checksums and layout when it has an indexer.
+          if [ -f scripts/update-repository.sh ]; then
+            bash scripts/update-repository.sh "$GITHUB_WORKSPACE/public"
+            exit 0
+          fi
+          rm -rf public
+          mkdir -p public/debs
+          rsync -a --exclude="/public/" --exclude="/.git/" --exclude="/.github/" --exclude="/.repomgr-results/" ./ public/
+          touch public/.nojekyll
+          cp -f icon.png CydiaIcon.png public/ 2>/dev/null || true
+          cd public
+          dpkg-scanpackages --multiversion debs /dev/null > Packages
+          rm -f Packages.gz Packages.bz2
+          gzip -n -k Packages
+          bzip2 -k Packages
+          if [ ! -f Release ]; then
+            printf 'Origin: %s\nLabel: %s\nSuite: stable\nCodename: sileo\nArchitectures: iphoneos-arm64 iphoneos-arm64e\nComponents: main\nDescription: %s\n' "${GITHUB_REPOSITORY##*/}" "${GITHUB_REPOSITORY##*/}" "${GITHUB_REPOSITORY##*/}" > Release
+          fi
+          if [ ! -f index.html ]; then
+            printf '<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width><title>%s</title><h1>%s</h1><p>添加此地址到 Sileo。</p>' "${GITHUB_REPOSITORY##*/}" "${GITHUB_REPOSITORY##*/}" > index.html
+          fi
+      - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
+        if: steps.transfer.outputs.has_changes == 'true'
+        with:
+          path: public
+      - uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4
+        id: deployment
+        if: steps.transfer.outputs.has_changes == 'true'
+      - name: Summarize per-file transfer outcome
+        if: always()
+        shell: bash
+        env:
+          TASK_ID: ${{ inputs.task_id }}
+          DEPLOY_OUTCOME: ${{ steps.deployment.outcome }}
+        run: |
+          set -euo pipefail
+          [[ "$TASK_ID" =~ ^[A-Za-z0-9-]{1,64}$ ]] || exit 0
+          result=".repomgr-results/${TASK_ID}.json"
+          if [ ! -f "$result" ]; then
+            echo "No per-file result was produced; inspect the failed transfer step." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          python3 - "$result" "$GITHUB_STEP_SUMMARY" "$DEPLOY_OUTCOME" <<'PYOUTCOME'
+          import json,sys
+          from pathlib import Path
+          rows=json.loads(Path(sys.argv[1]).read_text(encoding='utf-8'))
+          counts={state:sum(row.get('status')==state for row in rows) for state in ('success','skipped','failure')}
+          with open(sys.argv[2],'a',encoding='utf-8') as summary:
+              summary.write(f"\n### RepoMgr final outcome\n- Transferred files: {counts['success']}\n- Already present: {counts['skipped']}\n- Failed files: {counts['failure']}\n- Pages deployment: {sys.argv[3]}\n")
+          if counts['failure']:
+              print(f"Per-file transfer had {counts['failure']} failure(s); Pages deployment outcome: {sys.argv[3]}",file=sys.stderr)
+              raise SystemExit(1)
+          if counts['success']+counts['skipped']==0:
+              print('No file was transferred or already present.',file=sys.stderr)
+              raise SystemExit(1)
+          PYOUTCOME
