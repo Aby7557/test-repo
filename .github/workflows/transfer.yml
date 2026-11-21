@@ -1,5 +1,5 @@
 # RepoMgr-Transfer-API: 1
-# RepoMgr-Transfer-Template: 7
+# RepoMgr-Transfer-Template: 10
 name: Cloud transfer deb
 run-name: "RepoMgr ${{ inputs.task_id }}"
 
@@ -21,6 +21,7 @@ permissions:
 concurrency:
   group: pages
   cancel-in-progress: false
+  queue: max
 
 jobs:
   transfer:
@@ -31,6 +32,9 @@ jobs:
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
       - name: Download and commit
         id: transfer
         shell: bash
@@ -63,9 +67,12 @@ jobs:
               for _ in range(6):
                   host,ip=public_url(url)
                   pin='['+ip+']' if ':' in ip else ip
-                  done=subprocess.run(['curl','--disable','-fsS','--proto','=https','--noproxy','*','--resolve',host+':443:'+pin,'--connect-timeout','15','--max-time','90','--max-filesize','41943040','--output',tmp,'--write-out','%{http_code}\n%{redirect_url}','--',url],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  done=subprocess.run(['curl','--disable','-fsS','--proto','=https','--noproxy','*','--resolve',host+':443:'+pin,'--connect-timeout','15','--max-time','90','--max-filesize','41943040','--output',tmp,'--write-out','%{http_code}\n%header{cf-mitigated}\n%{redirect_url}','--',url],stdout=subprocess.PIPE,stderr=subprocess.PIPE,text=True)
+                  status,_,metadata=done.stdout.partition('\n')
+                  mitigation,_,redirect=metadata.partition('\n')
+                  if mitigation.strip().lower()=='challenge': raise ValueError('cloudflare_challenge')
+                  if status=='403': raise ValueError('http_forbidden')
                   if done.returncode: raise ValueError('download_failed')
-                  status,_,redirect=done.stdout.partition('\n')
                   if status in ('301','302','303','307','308') and redirect:
                       url=urljoin(url,redirect.strip()); continue
                   if status!='200': raise ValueError('download_failed')
@@ -99,7 +106,7 @@ jobs:
                           result['status']='skipped'
                       else: dest.write_bytes(data); result['status']='success'
                   except Exception as error:
-                      allowed={'unsafe_url','dns_failed','download_failed','redirect_limit','invalid_input','invalid_filename','invalid_sha256','invalid_archive','checksum_mismatch','invalid_control','filename_conflict'}
+                      allowed={'unsafe_url','dns_failed','download_failed','cloudflare_challenge','http_forbidden','redirect_limit','invalid_input','invalid_filename','invalid_sha256','invalid_archive','checksum_mismatch','invalid_control','filename_conflict'}
                       result['error']=str(error) if isinstance(error,ValueError) and str(error) in allowed else 'transfer_failed'
                   finally:
                       if tmp: Path(tmp).unlink(missing_ok=True)
@@ -114,16 +121,29 @@ jobs:
           with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as f:
               for state in ['success','skipped','failure']: f.write(f"{state}: {sum(r['status']==state for r in results)}\n")
           with open(os.environ['GITHUB_OUTPUT'],'a') as output:
-              output.write('has_changes='+str(any(row['status']=='success' for row in results)).lower()+'\n')
+              # Existing, verified files still need to rebuild and deploy Pages
+              # after a prior run failed during indexing or deployment.
+              output.write('has_changes='+str(any(row['status'] in ('success','skipped') for row in results)).lower()+'\n')
           PYTRANSFER
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add debs .repomgr-results
           git diff --cached --quiet || git commit -m "Cloud transfer $TASK_ID"
-          git push origin "HEAD:$GITHUB_REF_NAME"
+          pushed=false
+          for attempt in 1 2 3; do
+            if git push origin "HEAD:$GITHUB_REF_NAME"; then pushed=true; break; fi
+            git fetch origin "$GITHUB_REF_NAME"
+            # Never overwrite concurrent changes. A conflicting same-path update
+            # fails visibly instead of silently replacing another uploader's file.
+            git rebase "origin/$GITHUB_REF_NAME" || { git rebase --abort; exit 1; }
+          done
+          [ "$pushed" = true ] || { echo 'Repository changed repeatedly; retry the task.' >&2; exit 1; }
       - uses: actions/configure-pages@983d7736d9b0ae728b81ab479565c72886d7745b # v5
+        id: pages
         if: steps.transfer.outputs.has_changes == 'true'
       - name: Build package index
+        env:
+          REPOMGR_PAGES_URL: ${{ steps.pages.outputs.base_url }}
         if: steps.transfer.outputs.has_changes == 'true'
         shell: bash
         run: |
@@ -142,6 +162,30 @@ jobs:
           cp -f icon.png CydiaIcon.png public/ 2>/dev/null || true
           cd public
           dpkg-scanpackages --multiversion debs /dev/null > Packages
+          python3 - <<'PYMETADATA'
+          import json,re,os
+          from urllib.parse import urljoin
+          from pathlib import Path
+          output=[]
+          for stanza in Path('Packages').read_text().split('\n\n'):
+              if not stanza.strip(): continue
+              match=re.search(r'^Package: ([a-z0-9][a-z0-9+.-]*)$',stanza,re.M)
+              path=Path('depictions')/match[1]/'depiction.json' if match else None
+              if path and path.is_file():
+                  document=json.loads(path.read_text())
+                  metadata=document.get('repomgr',{})
+                  if not isinstance(metadata,dict): raise ValueError('Invalid display metadata')
+                  fields={k:v for k,v in metadata.items() if k in ('Name','Description','Author') and isinstance(v,str)}
+                  base=os.environ.get('REPOMGR_PAGES_URL','').rstrip('/')+'/'
+                  fields['SileoDepiction']=urljoin(base,path.as_posix())
+                  if (path.parent/'icon.png').is_file(): fields['Icon']=urljoin(base,(path.parent/'icon.png').as_posix())
+                  for key,value in fields.items():
+                      value=value.replace('\r','').replace('\n','\n ')
+                      stanza=re.sub(r'^'+key+r':[^\n]*(?:\n[ \t][^\n]*)*\n?', '', stanza, flags=re.M)
+                      stanza=stanza.rstrip()+'\n'+key+': '+value
+              output.append(stanza)
+          Path('Packages').write_text('\n\n'.join(output)+'\n\n')
+          PYMETADATA
           rm -f Packages.gz Packages.bz2
           gzip -n -k Packages
           bzip2 -k Packages
@@ -151,6 +195,20 @@ jobs:
           if [ ! -f index.html ]; then
             printf '<!doctype html><meta charset=utf-8><meta name=viewport content=width=device-width><title>%s</title><h1>%s</h1><p>添加此地址到 Sileo。</p>' "${GITHUB_REPOSITORY##*/}" "${GITHUB_REPOSITORY##*/}" > index.html
           fi
+      - name: Record publication provenance
+        if: steps.transfer.outputs.has_changes == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PYPROVENANCE'
+          import hashlib,json,os,subprocess
+          from pathlib import Path
+          root=Path('public')
+          index=root/'Packages'
+          if not index.is_file(): raise SystemExit('Missing published Packages index')
+          manifest={'schema':1,'repository':os.environ['GITHUB_REPOSITORY'],'commit':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),'runID':os.environ['GITHUB_RUN_ID'],'indexSHA256':hashlib.sha256(index.read_bytes()).hexdigest()}
+          (root/'.repomgr-publication.json').write_text(json.dumps(manifest)+'\n')
+          with open(os.environ['GITHUB_STEP_SUMMARY'],'a') as summary: summary.write('\nPublication commit: `'+manifest['commit']+'`\nIndex SHA256: `'+manifest['indexSHA256']+'`\n')
+          PYPROVENANCE
       - uses: actions/upload-pages-artifact@56afc609e74202658d3ffba0e8f6dda462b719fa # v3
         if: steps.transfer.outputs.has_changes == 'true'
         with:
@@ -184,5 +242,8 @@ jobs:
               raise SystemExit(1)
           if counts['success']+counts['skipped']==0:
               print('No file was transferred or already present.',file=sys.stderr)
+              raise SystemExit(1)
+          if sys.argv[3] != 'success':
+              print('Files may be committed, but Pages is not published. Retry deployment.',file=sys.stderr)
               raise SystemExit(1)
           PYOUTCOME
